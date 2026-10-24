@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: dcbot-vote-relay
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: API_KEY
+        value: 3d780c45f8700ae15af4d329c9b031b04c70b1b9ce6d7ea6b2839ff5ee01481b
+      - key: VOTE_CHANNEL_NAME
+        sync: false
+      - key: NODE_VERSION
+        value: "20"
