@@ -58,7 +58,39 @@ HttpService:RequestAsync({
 
 See `examples/roblox-vote-sender.lua` for a reusable module.
 
+### Discord commands
+
+| Message | What happens |
+|---------|----------------|
+| `@VoteBot` | Hello reply |
+| `@VoteBot here` | Sets this channel for status/vote posts |
+| `@VoteBot status` | Asks Roblox `Status?`; game must be polling |
+
+Roblox status poller: `examples/roblox-status-poller.lua`
+
 ## API
+
+### `GET /ask-status` (new)
+
+Roblox polls this. After someone runs `@VoteBot status` in Discord:
+
+```json
+{ "ok": true, "ask": true, "question": "Status?", "requestId": "..." }
+```
+
+If nothing is pending:
+
+```json
+{ "ok": true, "ask": false, "question": null, "requestId": null }
+```
+
+### `POST /status-reply`
+
+Roblox answers the ask:
+
+```json
+{ "requestId": "...", "status": "Players: 5\nRound: 3" }
+```
 
 ### `POST /vote-ended`
 

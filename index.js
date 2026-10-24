@@ -1,5 +1,6 @@
 require("dotenv").config();
 
+const crypto = require("crypto");
 const express = require("express");
 const {
   Client,
@@ -13,6 +14,7 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const API_KEY = process.env.API_KEY;
 const VOTE_CHANNEL_ID = process.env.VOTE_CHANNEL_ID || "";
 const VOTE_CHANNEL_NAME = process.env.VOTE_CHANNEL_NAME || "";
+const STATUS_TIMEOUT_MS = Number(process.env.STATUS_TIMEOUT_MS || 90000);
 
 if (!DISCORD_TOKEN) {
   console.error("Missing DISCORD_TOKEN environment variable.");
@@ -30,6 +32,9 @@ const client = new Client({
 
 /** guildId -> channelId set by "@bot here" */
 const statusChannels = new Map();
+
+/** requestId -> pending Discord status ask */
+const pendingStatusAsks = new Map();
 
 const app = express();
 app.use(express.json());
@@ -59,6 +64,29 @@ function extractWinningVote(body) {
   }
 
   return null;
+}
+
+function formatStatusInfo(body) {
+  if (typeof body === "string" && body.trim()) return body.trim();
+  if (!body || typeof body !== "object") return null;
+
+  if (typeof body.status === "string" && body.status.trim()) return body.status.trim();
+  if (typeof body.message === "string" && body.message.trim()) return body.message.trim();
+  if (typeof body.info === "string" && body.info.trim()) return body.info.trim();
+
+  const parts = [];
+  if (body.players != null) parts.push(`Players: ${body.players}`);
+  if (body.round != null) parts.push(`Round: ${body.round}`);
+  if (body.wave != null) parts.push(`Wave: ${body.wave}`);
+  if (body.map != null) parts.push(`Map: ${body.map}`);
+  if (body.vote != null) parts.push(`Vote: ${body.vote}`);
+  if (Array.isArray(body.lines)) {
+    for (const line of body.lines) {
+      if (typeof line === "string" && line.trim()) parts.push(line.trim());
+    }
+  }
+
+  return parts.length ? parts.join("\n") : null;
 }
 
 function checkApiKey(req) {
@@ -140,12 +168,39 @@ async function announceWinningVote(winningVote) {
   return { message, results };
 }
 
+async function editDiscordMessage(channelId, messageId, content) {
+  try {
+    const channel = await client.channels.fetch(channelId);
+    if (!channel || !channel.isTextBased()) return;
+    const msg = await channel.messages.fetch(messageId);
+    await msg.edit(content);
+  } catch (err) {
+    console.error("Failed to edit Discord message:", err.message || err);
+  }
+}
+
+function expireOldStatusAsks() {
+  const now = Date.now();
+  for (const [id, ask] of pendingStatusAsks) {
+    if (now - ask.createdAt < STATUS_TIMEOUT_MS) continue;
+    pendingStatusAsks.delete(id);
+    editDiscordMessage(
+      ask.channelId,
+      ask.replyMessageId,
+      "Roblox did not respond with a status in time. Is the game running?"
+    );
+  }
+}
+
+setInterval(expireOldStatusAsks, 15000).unref?.();
+
 app.get("/", (_req, res) => {
   res.json({
     ok: true,
     service: "dcbot-vote-relay",
     discordReady: client.isReady(),
     guilds: client.guilds.cache.size,
+    pendingStatusAsks: pendingStatusAsks.size,
   });
 });
 
@@ -187,6 +242,75 @@ app.post("/vote-ended", async (req, res) => {
   }
 });
 
+/** Roblox polls this endpoint. When Discord ran @bot status, it returns question "Status?". */
+function handleAskStatus(req, res) {
+  if (!checkApiKey(req)) {
+    return res.status(401).json({ ok: false, error: "Invalid or missing API key" });
+  }
+
+  expireOldStatusAsks();
+
+  const next = [...pendingStatusAsks.values()].find((ask) => !ask.claimed);
+  if (!next) {
+    return res.json({ ok: true, ask: false, question: null, requestId: null });
+  }
+
+  next.claimed = true;
+  return res.json({
+    ok: true,
+    ask: true,
+    question: "Status?",
+    requestId: next.id,
+  });
+}
+
+/** Roblox answers a Status? ask from /ask-status. */
+async function handleStatusReply(req, res) {
+  if (!checkApiKey(req)) {
+    return res.status(401).json({ ok: false, error: "Invalid or missing API key" });
+  }
+
+  if (!client.isReady()) {
+    return res.status(503).json({ ok: false, error: "Discord bot not ready yet" });
+  }
+
+  const body = typeof req.body === "string" ? { status: req.body } : req.body || {};
+  const requestId = body.requestId || body.request_id || req.query.requestId;
+  if (!requestId || typeof requestId !== "string") {
+    return res.status(400).json({ ok: false, error: "Missing requestId" });
+  }
+
+  const ask = pendingStatusAsks.get(requestId);
+  if (!ask) {
+    return res.status(404).json({
+      ok: false,
+      error: "No pending status ask for that requestId",
+    });
+  }
+
+  const info = formatStatusInfo(body);
+  if (!info) {
+    return res.status(400).json({
+      ok: false,
+      error:
+        "Provide status/info/message text, or fields like players, round, wave, map",
+    });
+  }
+
+  pendingStatusAsks.delete(requestId);
+
+  const reply = `**Jurassic TD Status**\n${info}`;
+  await editDiscordMessage(ask.channelId, ask.replyMessageId, reply);
+
+  return res.json({ ok: true, posted: true });
+}
+
+app.get("/ask-status", handleAskStatus);
+app.post("/status-reply", handleStatusReply);
+// Aliases
+app.get("/roblox/ask-status", handleAskStatus);
+app.post("/roblox/status", handleStatusReply);
+
 client.once("ready", () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`In ${client.guilds.cache.size} guild(s)`);
@@ -209,6 +333,19 @@ client.on("messageCreate", async (message) => {
       await message.reply(
         "This is the chat I will upload my Jurassic TD status to."
       );
+      return;
+    }
+
+    if (/\bstatus\b/.test(text)) {
+      const reply = await message.reply("Asking Roblox for status…");
+      const id = crypto.randomUUID();
+      pendingStatusAsks.set(id, {
+        id,
+        channelId: message.channel.id,
+        replyMessageId: reply.id,
+        createdAt: Date.now(),
+        claimed: false,
+      });
       return;
     }
 
