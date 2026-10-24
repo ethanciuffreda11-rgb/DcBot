@@ -25,7 +25,7 @@ if (!API_KEY) {
 }
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
 });
 
 const app = express();
@@ -181,6 +181,17 @@ app.post("/vote-ended", async (req, res) => {
 client.once("ready", () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`In ${client.guilds.cache.size} guild(s)`);
+});
+
+client.on("messageCreate", async (message) => {
+  if (message.author.bot || !client.user) return;
+  if (!message.mentions.users.has(client.user.id)) return;
+
+  try {
+    await message.reply("hello im here for Jurassic Td");
+  } catch (err) {
+    console.error("Failed to reply to mention:", err);
+  }
 });
 
 client.on("error", (err) => {

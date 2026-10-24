@@ -11,7 +11,7 @@ Receives vote results from Roblox Studio and posts them to every Discord server 
 
 1. Go to [Discord Developer Portal](https://discord.com/developers/applications) → **New Application**
 2. Open **Bot** → **Reset Token** → copy the token
-3. Enable no special intents (Guilds only is enough)
+3. Privileged intents can stay off (mentions still work without Message Content Intent)
 4. **OAuth2 → URL Generator**: scopes `bot`, permission **Send Messages**
 5. Open the invite URL and add the bot to your server(s)
 
