@@ -28,6 +28,9 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
 });
 
+/** guildId -> channelId set by "@bot here" */
+const statusChannels = new Map();
+
 const app = express();
 app.use(express.json());
 app.use(express.text({ type: "text/plain" }));
@@ -71,6 +74,12 @@ function checkApiKey(req) {
 }
 
 async function findTargetChannel(guild) {
+  const rememberedId = statusChannels.get(guild.id);
+  if (rememberedId) {
+    const remembered = await guild.channels.fetch(rememberedId).catch(() => null);
+    if (remembered && remembered.isTextBased()) return remembered;
+  }
+
   if (VOTE_CHANNEL_ID) {
     const byId = await guild.channels.fetch(VOTE_CHANNEL_ID).catch(() => null);
     if (byId && byId.isTextBased()) return byId;
@@ -187,8 +196,23 @@ client.on("messageCreate", async (message) => {
   if (message.author.bot || !client.user) return;
   if (!message.mentions.users.has(client.user.id)) return;
 
+  const text = message.content
+    .replace(new RegExp(`<@!?${client.user.id}>`, "g"), "")
+    .trim()
+    .toLowerCase();
+
   try {
-    await message.reply("hello im here for Jurassic Td");
+    if (/\bhere\b/.test(text)) {
+      if (message.guild) {
+        statusChannels.set(message.guild.id, message.channel.id);
+      }
+      await message.reply(
+        "This is the chat I will upload my Jurassic TD status to."
+      );
+      return;
+    }
+
+    await message.reply("Hello, I'm here for Jurassic TD.");
   } catch (err) {
     console.error("Failed to reply to mention:", err);
   }
