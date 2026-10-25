@@ -480,6 +480,15 @@ client.once("ready", () => {
   ensurePlayersInterval();
 });
 
+async function respond(message, content) {
+  try {
+    return await message.reply(content);
+  } catch (err) {
+    console.error("reply failed, falling back to send:", err.message || err);
+    return message.channel.send(content);
+  }
+}
+
 client.on("messageCreate", async (message) => {
   if (message.author.bot || !client.user) return;
   if (!message.mentions.users.has(client.user.id)) return;
@@ -494,7 +503,8 @@ client.on("messageCreate", async (message) => {
       if (message.guild) {
         playersTracking.delete(message.guild.id);
       }
-      await message.reply(
+      await respond(
+        message,
         "Stopped. I will no longer post player counts every 30 minutes."
       );
       return;
@@ -502,12 +512,13 @@ client.on("messageCreate", async (message) => {
 
     if (/\bplayers\b/.test(text)) {
       if (!message.guild) {
-        await message.reply("Use this command in a server.");
+        await respond(message, "Use this command in a server.");
         return;
       }
       playersTracking.set(message.guild.id, true);
       ensurePlayersInterval();
-      await message.reply(
+      await respond(
+        message,
         "Got it. I'll post player counts to the vote/status channel every 30 minutes. Say `@VoteBot noplayers` to stop."
       );
       requestBroadcastPlayers();
@@ -515,7 +526,7 @@ client.on("messageCreate", async (message) => {
     }
 
     if (/\bph\b/.test(text)) {
-      const reply = await message.reply("Asking Roblox for player count…");
+      const reply = await respond(message, "Asking Roblox for player count…");
       queuePlayersAsk({
         mode: "once",
         channelId: message.channel.id,
@@ -529,14 +540,15 @@ client.on("messageCreate", async (message) => {
       if (message.guild) {
         statusChannels.set(message.guild.id, message.channel.id);
       }
-      await message.reply(
+      await respond(
+        message,
         "This is the chat I will upload my Jurassic TD status to."
       );
       return;
     }
 
     if (/\bstatus\b/.test(text)) {
-      const reply = await message.reply("Asking Roblox for status…");
+      const reply = await respond(message, "Asking Roblox for status…");
       const id = crypto.randomUUID();
       pendingStatusAsks.set(id, {
         id,
@@ -548,7 +560,7 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    await message.reply("Hello, I'm here for Jurassic TD.");
+    await respond(message, "Hello, I'm here for Jurassic TD.");
   } catch (err) {
     console.error("Failed to reply to mention:", err);
   }
