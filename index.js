@@ -208,46 +208,38 @@ function canSendTo(channel, member) {
   );
 }
 
-async function listSendableChannels(guild) {
+/** Only the configured channel — never spray every chat. */
+async function findTargetChannel(guild) {
   const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
-  const channels = await guild.channels.fetch();
-  const sendable = [];
 
-  const preferred = [];
-  const rememberedId = statusChannels.get(guild.id);
-  if (rememberedId) preferred.push(rememberedId);
-  if (VOTE_CHANNEL_ID) preferred.push(VOTE_CHANNEL_ID);
-
-  for (const id of preferred) {
-    const ch = channels.get(id) || (await guild.channels.fetch(id).catch(() => null));
-    if (ch && canSendTo(ch, me)) sendable.push(ch);
+  // 1) Explicit env channel (preferred)
+  if (VOTE_CHANNEL_ID) {
+    const byId = await guild.channels.fetch(VOTE_CHANNEL_ID).catch(() => null);
+    if (byId) return byId;
   }
 
+  // 2) Channel saved by /here
+  const rememberedId = statusChannels.get(guild.id);
+  if (rememberedId) {
+    const remembered = await guild.channels.fetch(rememberedId).catch(() => null);
+    if (remembered) return remembered;
+  }
+
+  // 3) Optional name match
   if (VOTE_CHANNEL_NAME) {
+    const channels = await guild.channels.fetch();
     const byName = channels.find(
       (ch) =>
         ch &&
         ch.type === ChannelType.GuildText &&
         ch.name.toLowerCase() === VOTE_CHANNEL_NAME.toLowerCase()
     );
-    if (byName && canSendTo(byName, me) && !sendable.some((c) => c.id === byName.id)) {
-      sendable.push(byName);
-    }
+    if (byName) return byName;
   }
 
-  for (const [, ch] of channels) {
-    if (!ch || ch.type !== ChannelType.GuildText) continue;
-    if (!canSendTo(ch, me)) continue;
-    if (sendable.some((c) => c.id === ch.id)) continue;
-    sendable.push(ch);
-  }
-
-  return sendable;
-}
-
-async function findTargetChannel(guild) {
-  const sendable = await listSendableChannels(guild);
-  return sendable[0] || null;
+  // No fallback to random channels
+  void me;
+  return null;
 }
 
 async function announceWinningVote(winningVote) {
@@ -255,35 +247,32 @@ async function announceWinningVote(winningVote) {
   const results = [];
 
   for (const [, guild] of client.guilds.cache) {
-    const sendable = await listSendableChannels(guild);
-    if (sendable.length === 0) {
+    const channel = await findTargetChannel(guild);
+    if (!channel) {
       results.push({
         guild: guild.name,
         ok: false,
         error:
-          "Missing Permissions in every channel. Run /here in a channel where VoteBot can send messages, or give the bot Send Messages.",
+          "No vote channel set. Set VOTE_CHANNEL_ID on Render or run /here in the target channel.",
       });
       continue;
     }
 
-    let posted = false;
-    const errors = [];
-    for (const channel of sendable) {
-      try {
-        await channel.send(message);
-        results.push({ guild: guild.name, ok: true, channel: channel.name, channelId: channel.id });
-        posted = true;
-        break;
-      } catch (err) {
-        errors.push(`#${channel.name}: ${err.message || String(err)}`);
-      }
-    }
-
-    if (!posted) {
+    try {
+      await channel.send(message);
+      results.push({
+        guild: guild.name,
+        ok: true,
+        channel: channel.name,
+        channelId: channel.id,
+      });
+    } catch (err) {
       results.push({
         guild: guild.name,
         ok: false,
-        error: errors.join(" | ") || "Missing Permissions",
+        channel: channel.name,
+        channelId: channel.id,
+        error: err.message || String(err),
       });
     }
   }
