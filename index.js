@@ -1,6 +1,8 @@
 require("dotenv").config();
 
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 const express = require("express");
 const {
   Client,
@@ -11,6 +13,9 @@ const {
   Routes,
   SlashCommandBuilder,
 } = require("discord.js");
+
+const DATA_DIR = path.join(__dirname, "data");
+const CHANNELS_FILE = path.join(DATA_DIR, "channels.json");
 
 const PORT = process.env.PORT || 3000;
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -68,8 +73,33 @@ const SLASH_COMMANDS = [
     .setDescription("Ask Roblox for Jurassic TD status"),
 ].map((c) => c.toJSON());
 
-/** guildId -> channelId set by "@bot here" */
+/** guildId -> channelId set by "/here" */
 const statusChannels = new Map();
+
+function loadStatusChannels() {
+  try {
+    if (!fs.existsSync(CHANNELS_FILE)) return;
+    const raw = JSON.parse(fs.readFileSync(CHANNELS_FILE, "utf8"));
+    for (const [guildId, channelId] of Object.entries(raw || {})) {
+      if (guildId && channelId) statusChannels.set(guildId, channelId);
+    }
+    console.log(`Loaded ${statusChannels.size} saved status channel(s)`);
+  } catch (err) {
+    console.error("Failed to load channels.json:", err.message || err);
+  }
+}
+
+function saveStatusChannels() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const obj = Object.fromEntries(statusChannels);
+    fs.writeFileSync(CHANNELS_FILE, JSON.stringify(obj, null, 2));
+  } catch (err) {
+    console.error("Failed to save channels.json:", err.message || err);
+  }
+}
+
+loadStatusChannels();
 
 /** guildId -> true when @Players auto-reports are on */
 const playersTracking = new Map();
@@ -178,21 +208,20 @@ function canSendTo(channel, member) {
   );
 }
 
-async function findTargetChannel(guild) {
+async function listSendableChannels(guild) {
   const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
-
-  const rememberedId = statusChannels.get(guild.id);
-  if (rememberedId) {
-    const remembered = await guild.channels.fetch(rememberedId).catch(() => null);
-    if (canSendTo(remembered, me)) return remembered;
-  }
-
-  if (VOTE_CHANNEL_ID) {
-    const byId = await guild.channels.fetch(VOTE_CHANNEL_ID).catch(() => null);
-    if (canSendTo(byId, me)) return byId;
-  }
-
   const channels = await guild.channels.fetch();
+  const sendable = [];
+
+  const preferred = [];
+  const rememberedId = statusChannels.get(guild.id);
+  if (rememberedId) preferred.push(rememberedId);
+  if (VOTE_CHANNEL_ID) preferred.push(VOTE_CHANNEL_ID);
+
+  for (const id of preferred) {
+    const ch = channels.get(id) || (await guild.channels.fetch(id).catch(() => null));
+    if (ch && canSendTo(ch, me)) sendable.push(ch);
+  }
 
   if (VOTE_CHANNEL_NAME) {
     const byName = channels.find(
@@ -201,17 +230,24 @@ async function findTargetChannel(guild) {
         ch.type === ChannelType.GuildText &&
         ch.name.toLowerCase() === VOTE_CHANNEL_NAME.toLowerCase()
     );
-    if (canSendTo(byName, me)) return byName;
+    if (byName && canSendTo(byName, me) && !sendable.some((c) => c.id === byName.id)) {
+      sendable.push(byName);
+    }
   }
 
-  if (canSendTo(guild.systemChannel, me)) {
-    return guild.systemChannel;
+  for (const [, ch] of channels) {
+    if (!ch || ch.type !== ChannelType.GuildText) continue;
+    if (!canSendTo(ch, me)) continue;
+    if (sendable.some((c) => c.id === ch.id)) continue;
+    sendable.push(ch);
   }
 
-  return (
-    channels.find((ch) => ch && ch.type === ChannelType.GuildText && canSendTo(ch, me)) ||
-    null
-  );
+  return sendable;
+}
+
+async function findTargetChannel(guild) {
+  const sendable = await listSendableChannels(guild);
+  return sendable[0] || null;
 }
 
 async function announceWinningVote(winningVote) {
@@ -219,19 +255,35 @@ async function announceWinningVote(winningVote) {
   const results = [];
 
   for (const [, guild] of client.guilds.cache) {
-    try {
-      const channel = await findTargetChannel(guild);
-      if (!channel) {
-        results.push({ guild: guild.name, ok: false, error: "No usable channel" });
-        continue;
-      }
-      await channel.send(message);
-      results.push({ guild: guild.name, ok: true, channel: channel.name });
-    } catch (err) {
+    const sendable = await listSendableChannels(guild);
+    if (sendable.length === 0) {
       results.push({
         guild: guild.name,
         ok: false,
-        error: err.message || String(err),
+        error:
+          "Missing Permissions in every channel. Run /here in a channel where VoteBot can send messages, or give the bot Send Messages.",
+      });
+      continue;
+    }
+
+    let posted = false;
+    const errors = [];
+    for (const channel of sendable) {
+      try {
+        await channel.send(message);
+        results.push({ guild: guild.name, ok: true, channel: channel.name, channelId: channel.id });
+        posted = true;
+        break;
+      } catch (err) {
+        errors.push(`#${channel.name}: ${err.message || String(err)}`);
+      }
+    }
+
+    if (!posted) {
+      results.push({
+        guild: guild.name,
+        ok: false,
+        error: errors.join(" | ") || "Missing Permissions",
       });
     }
   }
@@ -592,8 +644,13 @@ async function runCommand(name, ctx) {
   }
 
   if (name === "here") {
-    if (guild) statusChannels.set(guild.id, channel.id);
-    await reply("This is the chat I will upload my Jurassic TD status to.");
+    if (guild) {
+      statusChannels.set(guild.id, channel.id);
+      saveStatusChannels();
+    }
+    await reply(
+      `This is the chat I will upload my Jurassic TD status to.\n(Channel ID: \`${channel.id}\` — you can also set Render env \`VOTE_CHANNEL_ID\` to this so it survives restarts.)`
+    );
     return;
   }
 
