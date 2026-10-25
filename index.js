@@ -164,45 +164,53 @@ function checkApiKey(req) {
   return Boolean(provided) && provided === API_KEY;
 }
 
+function canSendTo(channel, member) {
+  if (!channel || !channel.isTextBased?.()) return false;
+  if (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.GuildAnnouncement) {
+    // still allow other text-based guild channels if sendable
+    if (!channel.isTextBased()) return false;
+  }
+  if (!member) return true;
+  const perms = channel.permissionsFor(member);
+  return Boolean(
+    perms?.has(PermissionFlagsBits.ViewChannel) &&
+      perms?.has(PermissionFlagsBits.SendMessages)
+  );
+}
+
 async function findTargetChannel(guild) {
+  const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
+
   const rememberedId = statusChannels.get(guild.id);
   if (rememberedId) {
     const remembered = await guild.channels.fetch(rememberedId).catch(() => null);
-    if (remembered && remembered.isTextBased()) return remembered;
+    if (canSendTo(remembered, me)) return remembered;
   }
 
   if (VOTE_CHANNEL_ID) {
     const byId = await guild.channels.fetch(VOTE_CHANNEL_ID).catch(() => null);
-    if (byId && byId.isTextBased()) return byId;
+    if (canSendTo(byId, me)) return byId;
   }
 
+  const channels = await guild.channels.fetch();
+
   if (VOTE_CHANNEL_NAME) {
-    const channels = await guild.channels.fetch();
     const byName = channels.find(
       (ch) =>
         ch &&
         ch.type === ChannelType.GuildText &&
         ch.name.toLowerCase() === VOTE_CHANNEL_NAME.toLowerCase()
     );
-    if (byName) return byName;
+    if (canSendTo(byName, me)) return byName;
   }
 
-  if (guild.systemChannel && guild.systemChannel.isTextBased()) {
+  if (canSendTo(guild.systemChannel, me)) {
     return guild.systemChannel;
   }
 
-  const channels = await guild.channels.fetch();
-  const me = guild.members.me;
   return (
-    channels.find((ch) => {
-      if (!ch || ch.type !== ChannelType.GuildText) return false;
-      if (!me) return true;
-      const perms = ch.permissionsFor(me);
-      return (
-        perms?.has(PermissionFlagsBits.ViewChannel) &&
-        perms?.has(PermissionFlagsBits.SendMessages)
-      );
-    }) || null
+    channels.find((ch) => ch && ch.type === ChannelType.GuildText && canSendTo(ch, me)) ||
+    null
   );
 }
 
