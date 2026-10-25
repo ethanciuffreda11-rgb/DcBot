@@ -1,7 +1,8 @@
 --[[
   Put this in a Script under ServerScriptService.
-  Polls the new /ask-status endpoint. When Discord says @bot status,
-  the bot answers with question "Status?" — then you POST the info back.
+  Polls Discord bot asks:
+    GET /ask-status  -> question "Status?"
+    GET /ask-players -> question "Players"
 
   Enable: Game Settings → Security → Allow HTTP Requests
 ]]
@@ -14,7 +15,6 @@ local API_KEY = "3d780c45f8700ae15af4d329c9b031b04c70b1b9ce6d7ea6b2839ff5ee01481
 local POLL_SECONDS = 5
 
 local function buildStatusInfo()
-	-- Customize this for Jurassic TD
 	local lines = {
 		"Players: " .. #Players:GetPlayers(),
 		-- "Round: " .. tostring(currentRound),
@@ -41,11 +41,11 @@ local function request(method, path, bodyTable)
 	end)
 
 	if not ok then
-		warn("[StatusPoller] request failed:", response)
+		warn("[DiscordPoller] request failed:", response)
 		return nil
 	end
 	if response.StatusCode < 200 or response.StatusCode >= 300 then
-		warn("[StatusPoller] bad status:", response.StatusCode, response.Body)
+		warn("[DiscordPoller] bad status:", response.StatusCode, response.Body)
 		return nil
 	end
 
@@ -56,14 +56,23 @@ local function request(method, path, bodyTable)
 end
 
 while true do
-	-- New endpoint: Discord asks "Status?" here
-	local pending = request("GET", "/ask-status")
-	if pending and pending.ask == true and pending.requestId then
-		print("[StatusPoller] Bot asked:", pending.question)
+	local statusAsk = request("GET", "/ask-status")
+	if statusAsk and statusAsk.ask == true and statusAsk.requestId then
+		print("[DiscordPoller] Bot asked:", statusAsk.question)
 		request("POST", "/status-reply", {
-			requestId = pending.requestId,
+			requestId = statusAsk.requestId,
 			status = buildStatusInfo(),
 		})
 	end
+
+	local playersAsk = request("GET", "/ask-players")
+	if playersAsk and playersAsk.ask == true and playersAsk.requestId then
+		print("[DiscordPoller] Bot asked:", playersAsk.question)
+		request("POST", "/players-reply", {
+			requestId = playersAsk.requestId,
+			players = #Players:GetPlayers(),
+		})
+	end
+
 	task.wait(POLL_SECONDS)
 end

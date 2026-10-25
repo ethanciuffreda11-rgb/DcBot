@@ -15,6 +15,9 @@ const API_KEY = process.env.API_KEY;
 const VOTE_CHANNEL_ID = process.env.VOTE_CHANNEL_ID || "";
 const VOTE_CHANNEL_NAME = process.env.VOTE_CHANNEL_NAME || "";
 const STATUS_TIMEOUT_MS = Number(process.env.STATUS_TIMEOUT_MS || 90000);
+const PLAYERS_INTERVAL_MS = Number(
+  process.env.PLAYERS_INTERVAL_MS || 30 * 60 * 1000
+);
 
 if (!DISCORD_TOKEN) {
   console.error("Missing DISCORD_TOKEN environment variable.");
@@ -33,8 +36,16 @@ const client = new Client({
 /** guildId -> channelId set by "@bot here" */
 const statusChannels = new Map();
 
+/** guildId -> true when @Players auto-reports are on */
+const playersTracking = new Map();
+
 /** requestId -> pending Discord status ask */
 const pendingStatusAsks = new Map();
+
+/** requestId -> pending Players ask */
+const pendingPlayersAsks = new Map();
+
+let playersIntervalStarted = false;
 
 const app = express();
 app.use(express.json());
@@ -87,6 +98,23 @@ function formatStatusInfo(body) {
   }
 
   return parts.length ? parts.join("\n") : null;
+}
+
+function extractPlayerCount(body) {
+  if (typeof body === "string") {
+    const n = body.match(/\d+/);
+    return n ? Number(n[0]) : null;
+  }
+  if (!body || typeof body !== "object") return null;
+
+  const raw =
+    body.players ?? body.playerCount ?? body.player_count ?? body.count ?? body.status;
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+  if (typeof raw === "string") {
+    const n = raw.match(/\d+/);
+    if (n) return Number(n[0]);
+  }
+  return null;
 }
 
 function checkApiKey(req) {
@@ -179,8 +207,59 @@ async function editDiscordMessage(channelId, messageId, content) {
   }
 }
 
-function expireOldStatusAsks() {
+function playersMessage(count) {
+  return `Players online in Jurassic TD: **${count}**`;
+}
+
+async function postPlayersToVoteChannels(count) {
+  const text = playersMessage(count);
+  for (const guildId of playersTracking.keys()) {
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild) continue;
+    try {
+      const channel = await findTargetChannel(guild);
+      if (!channel) continue;
+      await channel.send(text);
+    } catch (err) {
+      console.error(`Failed to post players in ${guild.name}:`, err.message || err);
+    }
+  }
+}
+
+function queuePlayersAsk({ mode, channelId, replyMessageId, guildId }) {
+  const id = crypto.randomUUID();
+  pendingPlayersAsks.set(id, {
+    id,
+    mode, // "once" | "broadcast"
+    channelId: channelId || null,
+    replyMessageId: replyMessageId || null,
+    guildId: guildId || null,
+    createdAt: Date.now(),
+    claimed: false,
+  });
+  return id;
+}
+
+function requestBroadcastPlayers() {
+  if (playersTracking.size === 0) return;
+  const alreadyPending = [...pendingPlayersAsks.values()].some(
+    (ask) => ask.mode === "broadcast" && !ask.claimed
+  );
+  if (alreadyPending) return;
+  queuePlayersAsk({ mode: "broadcast" });
+}
+
+function ensurePlayersInterval() {
+  if (playersIntervalStarted) return;
+  playersIntervalStarted = true;
+  setInterval(() => {
+    requestBroadcastPlayers();
+  }, PLAYERS_INTERVAL_MS).unref?.();
+}
+
+function expireOldAsks() {
   const now = Date.now();
+
   for (const [id, ask] of pendingStatusAsks) {
     if (now - ask.createdAt < STATUS_TIMEOUT_MS) continue;
     pendingStatusAsks.delete(id);
@@ -190,9 +269,21 @@ function expireOldStatusAsks() {
       "Roblox did not respond with a status in time. Is the game running?"
     );
   }
+
+  for (const [id, ask] of pendingPlayersAsks) {
+    if (now - ask.createdAt < STATUS_TIMEOUT_MS) continue;
+    pendingPlayersAsks.delete(id);
+    if (ask.mode === "once" && ask.channelId && ask.replyMessageId) {
+      editDiscordMessage(
+        ask.channelId,
+        ask.replyMessageId,
+        "Roblox did not respond with a player count in time. Is the game running?"
+      );
+    }
+  }
 }
 
-setInterval(expireOldStatusAsks, 15000).unref?.();
+setInterval(expireOldAsks, 15000).unref?.();
 
 app.get("/", (_req, res) => {
   res.json({
@@ -201,6 +292,8 @@ app.get("/", (_req, res) => {
     discordReady: client.isReady(),
     guilds: client.guilds.cache.size,
     pendingStatusAsks: pendingStatusAsks.size,
+    pendingPlayersAsks: pendingPlayersAsks.size,
+    playersTrackingGuilds: playersTracking.size,
   });
 });
 
@@ -242,13 +335,13 @@ app.post("/vote-ended", async (req, res) => {
   }
 });
 
-/** Roblox polls this endpoint. When Discord ran @bot status, it returns question "Status?". */
+/** Roblox polls this. When Discord asked for status, returns question "Status?". */
 function handleAskStatus(req, res) {
   if (!checkApiKey(req)) {
     return res.status(401).json({ ok: false, error: "Invalid or missing API key" });
   }
 
-  expireOldStatusAsks();
+  expireOldAsks();
 
   const next = [...pendingStatusAsks.values()].find((ask) => !ask.claimed);
   if (!next) {
@@ -264,7 +357,6 @@ function handleAskStatus(req, res) {
   });
 }
 
-/** Roblox answers a Status? ask from /ask-status. */
 async function handleStatusReply(req, res) {
   if (!checkApiKey(req)) {
     return res.status(401).json({ ok: false, error: "Invalid or missing API key" });
@@ -305,15 +397,87 @@ async function handleStatusReply(req, res) {
   return res.json({ ok: true, posted: true });
 }
 
+/**
+ * Roblox polls this (pair with the vote flow).
+ * When Discord ran @Players / @PH, returns question "Players".
+ */
+function handleAskPlayers(req, res) {
+  if (!checkApiKey(req)) {
+    return res.status(401).json({ ok: false, error: "Invalid or missing API key" });
+  }
+
+  expireOldAsks();
+
+  const next = [...pendingPlayersAsks.values()].find((ask) => !ask.claimed);
+  if (!next) {
+    return res.json({ ok: true, ask: false, question: null, requestId: null });
+  }
+
+  next.claimed = true;
+  return res.json({
+    ok: true,
+    ask: true,
+    question: "Players",
+    requestId: next.id,
+  });
+}
+
+async function handlePlayersReply(req, res) {
+  if (!checkApiKey(req)) {
+    return res.status(401).json({ ok: false, error: "Invalid or missing API key" });
+  }
+
+  if (!client.isReady()) {
+    return res.status(503).json({ ok: false, error: "Discord bot not ready yet" });
+  }
+
+  const body = typeof req.body === "string" ? { players: req.body } : req.body || {};
+  const requestId = body.requestId || body.request_id || req.query.requestId;
+  if (!requestId || typeof requestId !== "string") {
+    return res.status(400).json({ ok: false, error: "Missing requestId" });
+  }
+
+  const ask = pendingPlayersAsks.get(requestId);
+  if (!ask) {
+    return res.status(404).json({
+      ok: false,
+      error: "No pending players ask for that requestId",
+    });
+  }
+
+  const count = extractPlayerCount(body);
+  if (count == null) {
+    return res.status(400).json({
+      ok: false,
+      error: "Provide players as a number, e.g. { \"players\": 12 }",
+    });
+  }
+
+  pendingPlayersAsks.delete(requestId);
+
+  if (ask.mode === "once" && ask.channelId && ask.replyMessageId) {
+    await editDiscordMessage(ask.channelId, ask.replyMessageId, playersMessage(count));
+  } else {
+    await postPlayersToVoteChannels(count);
+  }
+
+  return res.json({ ok: true, posted: true, players: count });
+}
+
 app.get("/ask-status", handleAskStatus);
 app.post("/status-reply", handleStatusReply);
+app.get("/ask-players", handleAskPlayers);
+app.post("/players-reply", handlePlayersReply);
 // Aliases
 app.get("/roblox/ask-status", handleAskStatus);
 app.post("/roblox/status", handleStatusReply);
+app.get("/roblox/ask-players", handleAskPlayers);
+app.post("/roblox/players", handlePlayersReply);
 
 client.once("ready", () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`In ${client.guilds.cache.size} guild(s)`);
+  ensurePlayersInterval();
 });
 
 client.on("messageCreate", async (message) => {
@@ -326,6 +490,41 @@ client.on("messageCreate", async (message) => {
     .toLowerCase();
 
   try {
+    if (/\bnoplayers\b/.test(text)) {
+      if (message.guild) {
+        playersTracking.delete(message.guild.id);
+      }
+      await message.reply(
+        "Stopped. I will no longer post player counts every 30 minutes."
+      );
+      return;
+    }
+
+    if (/\bplayers\b/.test(text)) {
+      if (!message.guild) {
+        await message.reply("Use this command in a server.");
+        return;
+      }
+      playersTracking.set(message.guild.id, true);
+      ensurePlayersInterval();
+      await message.reply(
+        "Got it. I'll post player counts to the vote/status channel every 30 minutes. Say `@VoteBot noplayers` to stop."
+      );
+      requestBroadcastPlayers();
+      return;
+    }
+
+    if (/\bph\b/.test(text)) {
+      const reply = await message.reply("Asking Roblox for player count…");
+      queuePlayersAsk({
+        mode: "once",
+        channelId: message.channel.id,
+        replyMessageId: reply.id,
+        guildId: message.guild?.id || null,
+      });
+      return;
+    }
+
     if (/\bhere\b/.test(text)) {
       if (message.guild) {
         statusChannels.set(message.guild.id, message.channel.id);

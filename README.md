@@ -65,8 +65,11 @@ See `examples/roblox-vote-sender.lua` for a reusable module.
 | `@VoteBot` | Hello reply |
 | `@VoteBot here` | Sets this channel for status/vote posts |
 | `@VoteBot status` | Asks Roblox `Status?`; game must be polling |
+| `@VoteBot Players` | Every 30 min asks Roblox `Players` and posts count to the vote/status channel |
+| `@VoteBot noplayers` | Stops the 30 min player posts |
+| `@VoteBot PH` | Asks Roblox for player count and posts it in this chat |
 
-Roblox status poller: `examples/roblox-status-poller.lua`
+Roblox poller: `examples/roblox-status-poller.lua`
 
 ## API
 
@@ -90,6 +93,20 @@ Roblox answers the ask:
 
 ```json
 { "requestId": "...", "status": "Players: 5\nRound: 3" }
+```
+
+### `GET /ask-players`
+
+Roblox polls this. After `@VoteBot Players` or `@VoteBot PH`:
+
+```json
+{ "ok": true, "ask": true, "question": "Players", "requestId": "..." }
+```
+
+### `POST /players-reply`
+
+```json
+{ "requestId": "...", "players": 12 }
 ```
 
 ### `POST /vote-ended`
