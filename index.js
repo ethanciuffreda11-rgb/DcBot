@@ -16,6 +16,7 @@ const {
 
 const DATA_DIR = path.join(__dirname, "data");
 const CHANNELS_FILE = path.join(DATA_DIR, "channels.json");
+const WEBHOOK_FILE = path.join(DATA_DIR, "webhook.json");
 
 const PORT = process.env.PORT || 3000;
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -262,12 +263,33 @@ function describeChannelPerms(channel, member) {
   };
 }
 
-async function postViaWebhook(content) {
-  if (!DISCORD_WEBHOOK_URL) return false;
-  const res = await fetch(DISCORD_WEBHOOK_URL, {
+function loadSavedWebhookUrl() {
+  try {
+    if (!fs.existsSync(WEBHOOK_FILE)) return "";
+    const raw = JSON.parse(fs.readFileSync(WEBHOOK_FILE, "utf8"));
+    return typeof raw?.url === "string" ? raw.url : "";
+  } catch {
+    return "";
+  }
+}
+
+function saveWebhookUrl(url) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(WEBHOOK_FILE, JSON.stringify({ url }, null, 2));
+  } catch (err) {
+    console.error("Failed to save webhook.json:", err.message || err);
+  }
+}
+
+async function postViaWebhookUrl(webhookUrl, content) {
+  const res = await fetch(webhookUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({
+      content,
+      allowed_mentions: { parse: [] },
+    }),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -276,70 +298,109 @@ async function postViaWebhook(content) {
   return true;
 }
 
+/** Create or reuse a VoteBot webhook in the target channel (bypasses broken channel.send). */
+async function ensureVoteWebhook(channel) {
+  if (!channel || typeof channel.fetchWebhooks !== "function") {
+    throw new Error("Channel cannot host webhooks");
+  }
+
+  const hooks = await channel.fetchWebhooks();
+  let hook = hooks.find(
+    (w) => w.name === "VoteBot" && (!w.owner || w.owner.id === client.user.id)
+  );
+
+  if (!hook) {
+    hook = await channel.createWebhook({
+      name: "VoteBot",
+      reason: "Jurassic TD vote announcements",
+    });
+  }
+
+  const url = hook.url;
+  if (!url) throw new Error("Webhook has no URL");
+  saveWebhookUrl(url);
+  return url;
+}
+
 async function announceWinningVote(winningVote) {
   const message = `The Vote has Ended and the people want "${winningVote}"!`;
   const results = [];
+  const attempts = [];
 
-  // Prefer webhook if configured — does not need bot Send Messages
-  if (DISCORD_WEBHOOK_URL) {
+  // 1) Env webhook (Render DISCORD_WEBHOOK_URL)
+  // 2) Saved webhook from a previous create
+  // 3) Auto-create webhook in VOTE_CHANNEL_ID / /here channel
+  // Never rely on channel.send — Discord was returning Missing Permissions even when perms looked OK.
+
+  const candidates = [];
+  if (DISCORD_WEBHOOK_URL) candidates.push({ via: "env", url: DISCORD_WEBHOOK_URL });
+  const saved = loadSavedWebhookUrl();
+  if (saved && saved !== DISCORD_WEBHOOK_URL) {
+    candidates.push({ via: "saved", url: saved });
+  }
+
+  for (const candidate of candidates) {
     try {
-      await postViaWebhook(message);
-      results.push({
-        guild: "webhook",
-        ok: true,
-        via: "webhook",
-      });
+      await postViaWebhookUrl(candidate.url, message);
+      results.push({ ok: true, via: `webhook:${candidate.via}` });
       return { message, results };
     } catch (err) {
-      results.push({
-        guild: "webhook",
-        ok: false,
-        via: "webhook",
-        error: err.message || String(err),
-      });
-      // fall through to channel send
+      attempts.push(`${candidate.via}: ${err.message || err}`);
     }
   }
 
+  // Auto-create webhook in the configured channel
   for (const [, guild] of client.guilds.cache) {
-    const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
     const channel = await findTargetChannel(guild);
     if (!channel) {
-      results.push({
-        guild: guild.name,
-        ok: false,
-        error:
-          "No vote channel set. Set VOTE_CHANNEL_ID on Render or run /here in the target channel.",
-      });
+      attempts.push(`${guild.name}: no VOTE_CHANNEL_ID /here channel`);
       continue;
     }
 
-    const permInfo = describeChannelPerms(channel, me);
-
     try {
-      if (!channel.isTextBased()) {
-        throw new Error(`Channel type ${channel.type} is not text-based`);
-      }
-      await channel.send({ content: message });
+      const url = await ensureVoteWebhook(channel);
+      await postViaWebhookUrl(url, message);
       results.push({
-        guild: guild.name,
         ok: true,
+        via: "webhook:auto",
+        guild: guild.name,
         channel: channel.name,
         channelId: channel.id,
-        via: "bot",
       });
+      return { message, results };
     } catch (err) {
+      const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
+      const perms = describeChannelPerms(channel, me);
+      attempts.push(
+        `${guild.name}/#${channel.name}: ${err.message || err} | manageWebhooks asked`
+      );
       results.push({
         guild: guild.name,
         ok: false,
         channel: channel.name,
         channelId: channel.id,
         error: err.message || String(err),
-        permissions: permInfo,
+        permissions: {
+          ...perms,
+          manageWebhooks: me
+            ? channel.permissionsFor(me)?.has(PermissionFlagsBits.ManageWebhooks)
+            : null,
+        },
+        attempts,
         hint:
-          "In #rawry-info → Permissions, add the VoteBot role (not only @everyone) and allow View Channel + Send Messages. Or create a channel webhook and set DISCORD_WEBHOOK_URL on Render.",
+          "Give VoteBot Manage Webhooks + View Channel in #rawry-info, OR set DISCORD_WEBHOOK_URL on Render to a webhook you create in that channel.",
       });
     }
+  }
+
+  if (results.length === 0) {
+    results.push({
+      ok: false,
+      error: "Could not post vote via webhook",
+      attempts,
+      hint:
+        "Set DISCORD_WEBHOOK_URL on Render, or give the bot Manage Webhooks in the vote channel.",
+    });
   }
 
   return { message, results };
