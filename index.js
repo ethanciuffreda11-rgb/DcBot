@@ -22,6 +22,8 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const API_KEY = process.env.API_KEY;
 const VOTE_CHANNEL_ID = process.env.VOTE_CHANNEL_ID || "";
 const VOTE_CHANNEL_NAME = process.env.VOTE_CHANNEL_NAME || "";
+/** Optional webhook URL — bypasses channel Send Messages issues */
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || "";
 const STATUS_TIMEOUT_MS = Number(process.env.STATUS_TIMEOUT_MS || 90000);
 const PLAYERS_INTERVAL_MS = Number(
   process.env.PLAYERS_INTERVAL_MS || 30 * 60 * 1000
@@ -71,6 +73,9 @@ const SLASH_COMMANDS = [
   new SlashCommandBuilder()
     .setName("status")
     .setDescription("Ask Roblox for Jurassic TD status"),
+  new SlashCommandBuilder()
+    .setName("checkperms")
+    .setDescription("Show what permissions VoteBot has in this channel"),
 ].map((c) => c.toJSON());
 
 /** guildId -> channelId set by "/here" */
@@ -210,8 +215,6 @@ function canSendTo(channel, member) {
 
 /** Only the configured channel — never spray every chat. */
 async function findTargetChannel(guild) {
-  const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
-
   // 1) Explicit env channel (preferred)
   if (VOTE_CHANNEL_ID) {
     const byId = await guild.channels.fetch(VOTE_CHANNEL_ID).catch(() => null);
@@ -237,16 +240,69 @@ async function findTargetChannel(guild) {
     if (byName) return byName;
   }
 
-  // No fallback to random channels
-  void me;
   return null;
+}
+
+function describeChannelPerms(channel, member) {
+  if (!channel) return { ok: false, reason: "channel missing" };
+  if (!member) return { ok: false, reason: "bot member missing from cache" };
+
+  const perms = channel.permissionsFor(member);
+  if (!perms) return { ok: false, reason: "could not resolve permissions" };
+
+  return {
+    channelType: channel.type,
+    channelName: channel.name,
+    viewChannel: perms.has(PermissionFlagsBits.ViewChannel),
+    sendMessages: perms.has(PermissionFlagsBits.SendMessages),
+    sendMessagesInThreads: perms.has(PermissionFlagsBits.SendMessagesInThreads),
+    embedLinks: perms.has(PermissionFlagsBits.EmbedLinks),
+    readHistory: perms.has(PermissionFlagsBits.ReadMessageHistory),
+    administrator: perms.has(PermissionFlagsBits.Administrator),
+  };
+}
+
+async function postViaWebhook(content) {
+  if (!DISCORD_WEBHOOK_URL) return false;
+  const res = await fetch(DISCORD_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Webhook failed (${res.status}): ${text.slice(0, 200)}`);
+  }
+  return true;
 }
 
 async function announceWinningVote(winningVote) {
   const message = `The Vote has Ended and the people want "${winningVote}"!`;
   const results = [];
 
+  // Prefer webhook if configured — does not need bot Send Messages
+  if (DISCORD_WEBHOOK_URL) {
+    try {
+      await postViaWebhook(message);
+      results.push({
+        guild: "webhook",
+        ok: true,
+        via: "webhook",
+      });
+      return { message, results };
+    } catch (err) {
+      results.push({
+        guild: "webhook",
+        ok: false,
+        via: "webhook",
+        error: err.message || String(err),
+      });
+      // fall through to channel send
+    }
+  }
+
   for (const [, guild] of client.guilds.cache) {
+    const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
     const channel = await findTargetChannel(guild);
     if (!channel) {
       results.push({
@@ -258,13 +314,19 @@ async function announceWinningVote(winningVote) {
       continue;
     }
 
+    const permInfo = describeChannelPerms(channel, me);
+
     try {
-      await channel.send(message);
+      if (!channel.isTextBased()) {
+        throw new Error(`Channel type ${channel.type} is not text-based`);
+      }
+      await channel.send({ content: message });
       results.push({
         guild: guild.name,
         ok: true,
         channel: channel.name,
         channelId: channel.id,
+        via: "bot",
       });
     } catch (err) {
       results.push({
@@ -273,6 +335,9 @@ async function announceWinningVote(winningVote) {
         channel: channel.name,
         channelId: channel.id,
         error: err.message || String(err),
+        permissions: permInfo,
+        hint:
+          "In #rawry-info → Permissions, add the VoteBot role (not only @everyone) and allow View Channel + Send Messages. Or create a channel webhook and set DISCORD_WEBHOOK_URL on Render.",
       });
     }
   }
@@ -632,13 +697,26 @@ async function runCommand(name, ctx) {
     return;
   }
 
+  if (name === "checkperms") {
+    const me =
+      guild?.members?.me ||
+      (guild ? await guild.members.fetchMe().catch(() => null) : null);
+    const info = describeChannelPerms(channel, me);
+    await reply("```json\n" + JSON.stringify(info, null, 2) + "\n```");
+    return;
+  }
+
   if (name === "here") {
     if (guild) {
       statusChannels.set(guild.id, channel.id);
       saveStatusChannels();
     }
+    const me =
+      guild?.members?.me ||
+      (guild ? await guild.members.fetchMe().catch(() => null) : null);
+    const info = describeChannelPerms(channel, me);
     await reply(
-      `This is the chat I will upload my Jurassic TD status to.\n(Channel ID: \`${channel.id}\` — you can also set Render env \`VOTE_CHANNEL_ID\` to this so it survives restarts.)`
+      `This is the chat I will upload my Jurassic TD status to.\n(Channel ID: \`${channel.id}\`)\nView: ${info.viewChannel} | Send: ${info.sendMessages}`
     );
     return;
   }
