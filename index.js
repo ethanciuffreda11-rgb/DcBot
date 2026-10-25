@@ -32,13 +32,17 @@ if (!API_KEY) {
   process.exit(1);
 }
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-  ],
-});
+// Message Content is privileged — only enable if toggled ON in the Discord
+// Developer Portal (Bot → Privileged Gateway Intents) AND ENABLE_MESSAGE_CONTENT=true.
+const intents = [
+  GatewayIntentBits.Guilds,
+  GatewayIntentBits.GuildMessages,
+];
+if (process.env.ENABLE_MESSAGE_CONTENT === "true") {
+  intents.push(GatewayIntentBits.MessageContent);
+}
+
+const client = new Client({ intents });
 
 const SLASH_COMMANDS = [
   new SlashCommandBuilder()

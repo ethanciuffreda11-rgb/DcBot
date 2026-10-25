@@ -15,3 +15,5 @@ services:
         sync: false
       - key: NODE_VERSION
         value: "20"
+      - key: ENABLE_MESSAGE_CONTENT
+        value: "false"
