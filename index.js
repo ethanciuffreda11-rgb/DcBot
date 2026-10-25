@@ -7,6 +7,9 @@ const {
   GatewayIntentBits,
   ChannelType,
   PermissionFlagsBits,
+  REST,
+  Routes,
+  SlashCommandBuilder,
 } = require("discord.js");
 
 const PORT = process.env.PORT || 3000;
@@ -30,8 +33,36 @@ if (!API_KEY) {
 }
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
 });
+
+const SLASH_COMMANDS = [
+  new SlashCommandBuilder()
+    .setName("hello")
+    .setDescription("Check that VoteBot is online"),
+  new SlashCommandBuilder()
+    .setName("here")
+    .setDescription("Use this channel for Jurassic TD vote/status posts"),
+  new SlashCommandBuilder()
+    .setName("help")
+    .setDescription("List VoteBot commands"),
+  new SlashCommandBuilder()
+    .setName("players")
+    .setDescription("Post player counts every 30 minutes"),
+  new SlashCommandBuilder()
+    .setName("noplayers")
+    .setDescription("Stop 30-minute player count posts"),
+  new SlashCommandBuilder()
+    .setName("ph")
+    .setDescription("Get player count once in this channel"),
+  new SlashCommandBuilder()
+    .setName("status")
+    .setDescription("Ask Roblox for Jurassic TD status"),
+].map((c) => c.toJSON());
 
 /** guildId -> channelId set by "@bot here" */
 const statusChannels = new Map();
@@ -474,10 +505,46 @@ app.post("/roblox/status", handleStatusReply);
 app.get("/roblox/ask-players", handleAskPlayers);
 app.post("/roblox/players", handlePlayersReply);
 
-client.once("ready", () => {
+async function registerSlashCommands() {
+  const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
+  const appId = client.user.id;
+
+  try {
+    await rest.put(Routes.applicationCommands(appId), { body: SLASH_COMMANDS });
+    console.log(`Registered ${SLASH_COMMANDS.length} global slash commands`);
+  } catch (err) {
+    console.error("Failed to register global slash commands:", err);
+  }
+
+  for (const [guildId] of client.guilds.cache) {
+    try {
+      await rest.put(Routes.applicationGuildCommands(appId, guildId), {
+        body: SLASH_COMMANDS,
+      });
+      console.log(`Registered slash commands in guild ${guildId}`);
+    } catch (err) {
+      console.error(`Failed to register guild commands for ${guildId}:`, err);
+    }
+  }
+}
+
+client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`In ${client.guilds.cache.size} guild(s)`);
   ensurePlayersInterval();
+  await registerSlashCommands();
+});
+
+client.on("guildCreate", async (guild) => {
+  console.log(`Joined guild: ${guild.name} (${guild.id})`);
+  try {
+    const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
+    await rest.put(Routes.applicationGuildCommands(client.user.id, guild.id), {
+      body: SLASH_COMMANDS,
+    });
+  } catch (err) {
+    console.error("Failed to register commands for new guild:", err);
+  }
 });
 
 async function respond(message, content) {
@@ -489,78 +556,142 @@ async function respond(message, content) {
   }
 }
 
+const HELP_TEXT = [
+  "**VoteBot commands**",
+  "`/hello` or `@VoteBot` — check the bot is online",
+  "`/here` or `@VoteBot here` — set this channel for posts",
+  "`/players` — post player counts every 30 min",
+  "`/noplayers` — stop player counts",
+  "`/ph` — player count once here",
+  "`/status` — ask Roblox for status",
+].join("\n");
+
+async function runCommand(name, ctx) {
+  const { guild, channel, reply } = ctx;
+
+  if (name === "help") {
+    await reply(HELP_TEXT);
+    return;
+  }
+
+  if (name === "hello" || name === "") {
+    await reply("Hello, I'm here for Jurassic TD.");
+    return;
+  }
+
+  if (name === "here") {
+    if (guild) statusChannels.set(guild.id, channel.id);
+    await reply("This is the chat I will upload my Jurassic TD status to.");
+    return;
+  }
+
+  if (name === "noplayers") {
+    if (guild) playersTracking.delete(guild.id);
+    await reply("Stopped. I will no longer post player counts every 30 minutes.");
+    return;
+  }
+
+  if (name === "players") {
+    if (!guild) {
+      await reply("Use this command in a server.");
+      return;
+    }
+    playersTracking.set(guild.id, true);
+    ensurePlayersInterval();
+    await reply(
+      "Got it. I'll post player counts to the vote/status channel every 30 minutes. Use `/noplayers` to stop."
+    );
+    requestBroadcastPlayers();
+    return;
+  }
+
+  if (name === "ph") {
+    const sent = await reply("Asking Roblox for player count…");
+    queuePlayersAsk({
+      mode: "once",
+      channelId: channel.id,
+      replyMessageId: sent?.id,
+      guildId: guild?.id || null,
+    });
+    return;
+  }
+
+  if (name === "status") {
+    const sent = await reply("Asking Roblox for status…");
+    const id = crypto.randomUUID();
+    pendingStatusAsks.set(id, {
+      id,
+      channelId: channel.id,
+      replyMessageId: sent?.id,
+      createdAt: Date.now(),
+      claimed: false,
+    });
+  }
+}
+
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  try {
+    await runCommand(interaction.commandName, {
+      guild: interaction.guild,
+      channel: interaction.channel,
+      reply: async (content) => {
+        if (interaction.deferred || interaction.replied) {
+          return interaction.followUp(content);
+        }
+        await interaction.reply(content);
+        return interaction.fetchReply();
+      },
+    });
+  } catch (err) {
+    console.error("Slash command failed:", err);
+    try {
+      if (interaction.replied || interaction.deferred) {
+        await interaction.followUp({ content: "Something went wrong.", ephemeral: true });
+      } else {
+        await interaction.reply({ content: "Something went wrong.", ephemeral: true });
+      }
+    } catch (_) {
+      /* ignore */
+    }
+  }
+});
+
 client.on("messageCreate", async (message) => {
   if (message.author.bot || !client.user) return;
-  if (!message.mentions.users.has(client.user.id)) return;
+
+  const mentioned =
+    message.mentions.users.has(client.user.id) ||
+    message.content.includes(`<@${client.user.id}>`) ||
+    message.content.includes(`<@!${client.user.id}>`);
+
+  if (!mentioned) return;
+
+  console.log(
+    `Mention from ${message.author.tag} in ${message.guild?.name || "DM"}: ${message.content}`
+  );
 
   const text = message.content
     .replace(new RegExp(`<@!?${client.user.id}>`, "g"), "")
     .trim()
     .toLowerCase();
 
+  let name = "";
+  if (/\bnoplayers\b/.test(text)) name = "noplayers";
+  else if (/\bplayers\b/.test(text)) name = "players";
+  else if (/\bph\b/.test(text)) name = "ph";
+  else if (/\bhere\b/.test(text)) name = "here";
+  else if (/\bstatus\b/.test(text)) name = "status";
+  else if (/\bhelp\b/.test(text)) name = "help";
+  else name = "hello";
+
   try {
-    if (/\bnoplayers\b/.test(text)) {
-      if (message.guild) {
-        playersTracking.delete(message.guild.id);
-      }
-      await respond(
-        message,
-        "Stopped. I will no longer post player counts every 30 minutes."
-      );
-      return;
-    }
-
-    if (/\bplayers\b/.test(text)) {
-      if (!message.guild) {
-        await respond(message, "Use this command in a server.");
-        return;
-      }
-      playersTracking.set(message.guild.id, true);
-      ensurePlayersInterval();
-      await respond(
-        message,
-        "Got it. I'll post player counts to the vote/status channel every 30 minutes. Say `@VoteBot noplayers` to stop."
-      );
-      requestBroadcastPlayers();
-      return;
-    }
-
-    if (/\bph\b/.test(text)) {
-      const reply = await respond(message, "Asking Roblox for player count…");
-      queuePlayersAsk({
-        mode: "once",
-        channelId: message.channel.id,
-        replyMessageId: reply.id,
-        guildId: message.guild?.id || null,
-      });
-      return;
-    }
-
-    if (/\bhere\b/.test(text)) {
-      if (message.guild) {
-        statusChannels.set(message.guild.id, message.channel.id);
-      }
-      await respond(
-        message,
-        "This is the chat I will upload my Jurassic TD status to."
-      );
-      return;
-    }
-
-    if (/\bstatus\b/.test(text)) {
-      const reply = await respond(message, "Asking Roblox for status…");
-      const id = crypto.randomUUID();
-      pendingStatusAsks.set(id, {
-        id,
-        channelId: message.channel.id,
-        replyMessageId: reply.id,
-        createdAt: Date.now(),
-        claimed: false,
-      });
-      return;
-    }
-
-    await respond(message, "Hello, I'm here for Jurassic TD.");
+    await runCommand(name, {
+      guild: message.guild,
+      channel: message.channel,
+      reply: (content) => respond(message, content),
+    });
   } catch (err) {
     console.error("Failed to reply to mention:", err);
   }
